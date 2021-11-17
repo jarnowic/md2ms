@@ -1,0 +1,413 @@
+#!/usr/bin/awk -f
+
+function isblank(s) {
+	return s !~ /[^ 	]/
+}
+
+function lstrip0(rs) {
+	if(!match($0, "^" rs))
+		return ""
+	rs = substr($0, 1, RLENGTH)
+	$0 = substr($0, RLENGTH+1)
+	return rs
+}
+
+# TODO reference links?
+# FIXME accepts close parens in urls?
+function lstrip0link(A,	tmp) {
+	if(!(tmp = lstrip0("\\([^)]*\\)")))
+		return 0
+	
+	A["href"] = substr(tmp, 2, RLENGTH-2)
+	sub(/^[ 	]*/, "", A["href"])
+	sub(/[ 	]*$/, "", A["href"])
+	
+	if(!match(A["href"], /".*"/))
+		return 1
+	
+	A["title"] = substr(A["href"], RSTART+1, RLENGTH-2)
+	A["href"] = substr(A["href"], 1, RSTART-1)
+	sub(/[ 	]*$/, "", A["href"])
+	
+	return 2
+}
+
+function regexpesc(s) {
+	gsub(/[*+?\\|^$[\]()]/, "\\\\&", s)
+	return s
+}
+
+function stackinit(S) {
+	S["length"] = 0
+}
+
+function stacklen(S) {
+	return S["length"]
+}
+
+function stacktop(S) {
+	return S["length"] > 0 ? S[S["length"]-1] : ""
+}
+
+function stackpop(S) {
+	return S["length"] > 0 ? S[--S["length"]] : ""
+}
+
+function stackpush(S,x) {
+	S[S["length"]++] = x
+	return S["length"]
+}
+
+# global variables
+
+BEGIN {
+	INDENT  = "(    | ? ? ?	)"
+	NINDENT = " ? ? ?"
+	WORD    = "[A-Za-z0-9'-]+"
+	
+	block_re_open["header"] = "#+"
+	block_re_open["rule"]   = NINDENT "(\\*\\*\\*+|---+|___+)[ 	]*$"
+	
+	block_re_open["blockquote"] = NINDENT "> ?"
+	block_re_open["codeblock"]  = INDENT
+	block_re_open["list"]       = NINDENT "([*+-]|[1-9][0-9]*\\.)[ 	]"
+	block_re_open["troff"]      = "[.']"
+	
+	block_re_cont["blockquote"] = NINDENT "> ?"
+	block_re_cont["codeblock"]  = INDENT
+	block_re_cont["list"]       = INDENT
+	block_re_cont["troff"]      = ""
+	
+	block_tag_close["blockquote"] = ".QE"
+	block_tag_close["codeblock"]  = ".P2"
+	
+	container_blocks = "^$|blockquote|list"
+	
+	span_re_open["esc"] = "\\\\("\
+		"[zk][^'( 	]|"\
+		"\\$[1-9]|"\
+		"[bCDhHlLNoSvwxX]'[^']*'|"\
+		"([fg]|[sn][+-]?)([^'( 	]|\\([^ 	][^ 	])|"\
+		"\\([^ 	][^ 	]|"\
+		".)"
+	span_re_open["char"] = "(---?|[\"'])"
+	span_re_open["cite"] = "@" WORD ";?"
+	span_re_open["uri"]  = "<[^ 	>]+[:@][^ 	>]+>"
+	span_re_open["ws"]   = "[ 	]+"
+	
+	span_re_open["emph"] = "(\\*\\*?\\*?|__?_?)"
+	span_re_open["code"] = "`+"
+	span_re_open["link"] = "\\["
+	span_re_open["note"] = "\\^\\["
+	span_re_open["img"]  = "!\\["
+	
+	span_re_close["emph"] = ""
+	span_re_close["code"] = ""
+	span_re_close["link"] = "\\]"
+	span_re_close["note"] = "\\]"
+	span_re_close["img"]  = "\\]"
+	
+	span_misc["char","--"]  = "\\-"
+	span_misc["char","---"] = "\\(em"
+	span_misc["char","\""]  = "``"
+	span_misc["char","'"]   = "`"
+	span_misc["emph",1]     = ".I"
+	span_misc["emph",2]     = ".B"
+	span_misc["emph",3]     = ".BI"
+	
+	stackinit(block_stack)
+	stackinit(list_indent)
+	stackpush(list_indent, 0)
+	blanklines = 1
+	
+	stackinit(span_stack)
+	stackinit(close_regexp)
+	lastchar = "\n"
+	
+	block = ""
+	span = ""
+	tmp = ""
+	cl = ""
+	
+	print ".nr FN 0 1"
+	print ".de HR"
+	print ".br"
+	print ".tl ''* * *''"
+	print ".."
+}
+
+# parse options at the start of each file
+
+FNR == 1 {
+	# eqndelim
+	if(length(eqndelim) == 1)
+		eqndelim = eqndelim eqndelim
+	span_re_open["eqn"]  = regexpesc(substr(eqndelim, 1, 1))
+	span_re_close["eqn"] = regexpesc(substr(eqndelim, 2, 1))
+	print ".EQ"
+	print "delim", (eqndelim ? eqndelim : "off")
+	print ".EN"
+}
+
+# block-level formatting
+
+{
+	block = ""
+	for(cl = 0; cl < stacklen(block_stack); ++cl) {
+		if(!lstrip0(block_re_cont[block_stack[cl]]))
+			break
+		else
+			block = block_stack[cl]
+	}
+	while(!isblank($0) && block ~ container_blocks) {
+		for(block in block_re_open) {
+			if(tmp = lstrip0(block_re_open[block])) {
+				unwind_block_stack(cl)
+				open_block(block, tmp)
+				if(block in block_re_cont)
+					cl = stackpush(block_stack, block)
+				break
+			}
+		}
+		if(!tmp) {
+			block = stacktop(block_stack)
+			if(blanklines += block == "codeblock") {
+				unwind_block_stack(cl)
+				open_block("paragraph")
+				block = stacktop(block_stack)
+			}
+			break
+		}
+	}
+}
+
+# TODO return the string, don't print it?
+function open_block(name, tag) {
+	if(stacktop(block_stack) == "list" &&
+		stacklen(block_stack) > stacktop(list_indent))
+	{
+		stackpush(list_indent, stacklen(block_stack))
+		print ".RS"
+	}
+	
+	if(name == "header") {
+		sub(/[ 	]*#*[ 	]*$/, "")
+		print ".NH", length(tag)
+	}
+	else if(name == "rule") {
+		print ".HR"
+	}
+	else if(name == "blockquote") {
+		print ".QS"
+	}
+	else if(name == "codeblock") {
+		print ".P1"
+	}
+	else if(name == "list") {
+		gsub(/[ 	]*/, "", tag)
+		print ".IP", tag
+	}
+	else if(name == "paragraph") {
+		print ".PP"
+	}
+	else if(name == "troff") {
+		$0 = tag $0
+	}
+}
+
+function unwind_block_stack(depth,	tag) {
+	stackinit(span_stack)
+	stackinit(close_regexp)
+	blanklines = 0
+	while(stacklen(block_stack) > depth) {
+		if(tag = block_tag_close[stackpop(block_stack)])
+			print tag
+		if(stacklen(block_stack) < stacktop(list_indent)) {
+			stackpop(list_indent)
+			print ".RE"
+		}
+	}
+}
+
+# handle whitespace and verbatim blocks
+
+isblank($0) {
+	blanklines++
+	next
+}
+
+block == "troff" {
+	print
+	next
+}
+
+block == "codeblock" {
+	for(; blanklines; blanklines--)
+		print ""
+	gsub(/\\/, "\\\\\\\\")
+	sub(/^[.']/, "\\\\\\&&")
+	print
+	next
+}
+
+# span-level formatting
+
+{
+	while($0) {
+		cl = ""
+		if(tmp = lstrip0(stacktop(close_regexp))) {
+			if(cl = close_span(stacktop(span_stack), tmp)) {
+				stackpop(close_regexp)
+				stackpop(span_stack)
+			} else {
+				$0 = tmp $0
+			}
+		}
+		if(!cl && stacktop(span_stack) !~ /eqn|code/) {
+			for(span in span_re_open) {
+				if(!(tmp = lstrip0(span_re_open[span])))
+					continue
+				if(!(cl = open_span(span, tmp))) {
+					cl = tmp
+					break
+				}
+				if(span in span_re_close) {
+					stackpush(span_stack, span)
+					tmp = regexpesc(tmp)
+					if(span_re_close[span])
+						tmp = span_re_close[span]
+					stackpush(close_regexp, tmp)
+				}
+				break
+			}
+		}
+		if(!cl)
+			cl = lstrip0(".")
+		if(cl ~ /\n/) {
+			if(lastchar == "\n")
+				sub(/^\n/, "", cl)
+			else if(span != "ws" &&
+					lastchar ~ /[^ 	]$/ &&
+					$0 ~ /^[^ 	]/)
+				cl = "\\c" cl
+		} else {
+			if(lastchar == "\n") {
+				sub(/^ +/, "", cl)
+				sub(/^[.']/, "\\\\\\&&", cl)
+			}
+			if(stacktop(span_stack) == "code" && cl == "\\")
+				cl = "\\\\"
+		}
+		if(cl) {
+			printf cl
+			lastchar = substr(cl, length(cl))
+		}
+	}
+	if(lastchar != "\n")
+		printf " \n"
+	lastchar = "\n"
+}
+
+function open_span(name, tag,	regexp) {
+	if(name == "esc") {
+		if(tag ~ /^\\[*_[\]().#+-]$/)
+			tag = substr(tag, 2, 1)
+		return tag
+	}
+	if(name == "char") {
+		tag = span_misc["char",tag]
+		if(tag ~ /^``?$/ && (lastchar ~ WORD "$" || $0 !~ "^" WORD))
+			gsub(/`/, "'", tag)
+		return tag
+	}
+	if(name == "cite") {
+		name = ""
+		if(lastchar ~ WORD "$")
+			return
+		if(stacktop(span_stack) != "link") {
+			if(sub(/;$/, "", tag))
+				$0 = ";" $0
+			if(lastchar == "\n")
+				name = "\n\\&"
+		}
+		return name "\n.[\n" tag "\n.]\n"
+	}
+	if(name == "uri") {
+		return "\\fC" substr(tag, 2, length(tag)-2) "\\fR"
+	}
+	if(name == "ws") {
+		if(length(tag) >= 2)
+			return "\n" (!$0 ? ".br\n" : "")
+		else
+			return " "
+	}
+	
+	if(name == "emph") {
+		if($0 !~ /^[^ 	]/)
+			return
+		if(tag ~ /_/ && lastchar ~ WORD "$")
+			return
+		return "\n" span_misc["emph",length(tag)] "\n"
+	}
+	if(name == "eqn") {
+		return substr(eqndelim, 1, 1)
+	}
+	if(name == "code") {
+		return "\n.CW\n"
+	}
+	if(name == "link") {
+		return "\n\\&\n"
+	}
+	if(name == "note") {
+		return "\\*([.\\n+(FN\\*(.]\n" \
+			".FS\n" \
+			"\\*([.\\n(FN\\*(.]\n"
+	}
+	if(name == "img") {
+		return "\n.ig\n"
+	}
+}
+
+function close_span(name, tag,	A) {
+	if(name == "emph") {
+		if(lastchar !~ /(^|[^ 	])$/)
+			return
+		if(tag ~ /_/ && $0 ~ "^" WORD)
+			return
+		return "\n.R\n"
+	}
+	if(name == "eqn") {
+		return substr(eqndelim, 2, 1)
+	}
+	if(name == "code") {
+		return "\n.R\n"
+	}
+	if(name == "link") {
+		if(lstrip0link(A)) {
+			sub(/^[ 	]$/, "", A["title"])
+			sub(/[ 	]*$/, "", A["title"])
+			if(A["title"] ~ WORD "$")
+				A["title"] = A["title"] "."
+			return "\n\\*([.\\n+(FN\\*(.]\n" \
+				".FS\n" \
+				"\\*([.\\n(FN\\*(.] " A["title"] "\n" \
+				".CW " A["href"] "\n" \
+				".FE\n"
+		}
+		return "\n"
+	}
+	if(name == "note") {
+		return "\n.FE\n"
+	}
+	if(name == "img") {
+		if(lstrip0link(A)) {
+			return "\n..\n" \
+				".BP " A["href"] " \"\" \"\" c \"\" w " \
+				"\"" A["title"] "\"\n"
+		}
+	}
+}
+
+# cleanup
+
+END { unwind_block_stack(0) }
